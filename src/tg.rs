@@ -154,18 +154,6 @@ async fn handle_command(
         Command::Test => {
             bot.send_message(message.chat.id, "Доступ к тестовой команде разрешен.")
                 .await?;
-
-            let mut options: Vec<InlineKeyboardButton> = Vec::new();
-
-            for map in &servers.lock().await.map {
-                options.push(InlineKeyboardButton::callback(map.0, map.0));
-            }
-
-            let keyboard = InlineKeyboardMarkup::default().append_row(options);
-
-            bot.send_message(message.chat.id, "Выеби своего бойца")
-                .reply_markup(keyboard)
-                .await?;
         }
 
         Command::Today => {
@@ -287,17 +275,20 @@ async fn handle_command(
         }
 
         Command::Switch => {
-            let mut options: Vec<InlineKeyboardButton> = Vec::new();
+            let (current_server, server_keys) = {
+                let server = servers.lock().await;
+                let current_server = server.current.clone();
+                let keys = server.map.keys().cloned().collect::<Vec<_>>();
+                (current_server, keys)
+            };
 
-            let server = servers.lock().await;
-
-            for map in &server.map {
-                options.push(InlineKeyboardButton::callback(map.0, map.0));
+            let mut keyboard = InlineKeyboardMarkup::default();
+            for key in server_keys {
+                keyboard =
+                    keyboard.append_row(vec![InlineKeyboardButton::callback(key.clone(), key)]);
             }
 
-            let keyboard = InlineKeyboardMarkup::default().append_row(options);
-
-            let text = format!("Текущий сервер: *{}*", server.current);
+            let text = format!("Текущий сервер: *{}*", current_server);
 
             bot.send_message(message.chat.id, text)
                 .parse_mode(ParseMode::MarkdownV2)
