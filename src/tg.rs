@@ -1,14 +1,27 @@
-use crate::previous_shift;
-use crate::shared::read_to_struct;
-use crate::{
-    Cfg, ServerState, auth, current_shift, list_shifts_month, list_shifts_week, logout, sum_shifts,
-};
-use serde::Deserialize;
+use crate::date::moscow_time;
+use crate::new::{Dates, GetShifts, Olap, Server};
+use crate::olap::{Filter, OlapMap, PeriodType, ReportConfig, ReportType};
+use crate::{Cfg, ServerState, shared::read_to_struct};
+
+use std::collections::HashMap;
 use std::{error::Error, sync::Arc};
-use teloxide::types::{InputPollOption, ParseMode};
-use teloxide::utils::markdown::escape;
-use teloxide::{prelude::*, utils::command::BotCommands};
+
+use serde::Deserialize;
+
+use teloxide::dispatching::{HandlerExt, UpdateFilterExt};
+use teloxide::payloads::SendMessageSetters;
+use teloxide::prelude::{Dispatcher, Requester, ResponseResult};
+use teloxide::types::Update;
+use teloxide::{Bot, dptree};
+use teloxide::{
+    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ParseMode},
+    utils::command::BotCommands,
+    utils::markdown::escape,
+};
+
 use tokio::sync::Mutex;
+
+type SharedOlap = Arc<Mutex<OlapMap>>;
 
 fn format_with_dots(number: usize) -> String {
     let number_string = number.to_string();
@@ -26,6 +39,18 @@ fn format_with_dots(number: usize) -> String {
     }
 
     result
+}
+
+async fn collect_server_info(
+    servers: Arc<Mutex<ServerState>>,
+    config: Cfg,
+) -> (String, String, String, String) {
+    let (login, pass) = (config.login, config.pass);
+
+    let servers = servers.lock().await;
+    let server_url = servers.map.get(&servers.current).unwrap().to_owned();
+
+    (login, pass, server_url, servers.current.clone())
 }
 
 #[derive(Deserialize)]
@@ -49,10 +74,12 @@ enum Command {
     Week,
     #[command(description = "Выручка за данный месяц")]
     Month,
-    #[command(description = "Переключиться на сервер")]
-    Switch { alias: String },
+    #[command(description = "Переключиться на другой сервер")]
+    Switch,
     #[command(description = "Вывести список доступных серверов")]
     List,
+    #[command(description = "Режим Olap отчёта")]
+    Olap,
 }
 
 pub async fn initialise() -> Result<(), Box<dyn Error>> {
@@ -61,7 +88,7 @@ pub async fn initialise() -> Result<(), Box<dyn Error>> {
     let allowed = Arc::new(accounts);
 
     let main_config: Cfg = read_to_struct("/etc/iiko-bot/cfg.toml").await?;
-    let servers = main_config.servers;
+    let servers = main_config.servers.clone();
     let first = servers.keys().next().expect("Список серверов пуст").clone();
 
     let state = ServerState {
@@ -69,36 +96,50 @@ pub async fn initialise() -> Result<(), Box<dyn Error>> {
         current: first,
     };
 
+    let olap_store: SharedOlap = Arc::new(Mutex::new(HashMap::new()));
+
     let servers = Arc::new(Mutex::new(state));
 
     let bot = Bot::new(token);
 
-    Command::repl(bot, move |bot, msg, cmd| {
-        let allowed = allowed.clone();
-        let servers = servers.clone();
-        async move { answer(bot, msg, cmd, allowed, servers).await }
-    })
-    .await;
+    let handler = dptree::entry()
+        .branch(
+            Update::filter_message()
+                .filter_command::<Command>()
+                .endpoint(handle_command),
+        )
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
+
+    Dispatcher::builder(bot.clone(), handler)
+        .dependencies(dptree::deps![
+            main_config.clone(),
+            allowed.clone(),
+            servers.clone(),
+            olap_store.clone()
+        ])
+        .build()
+        .dispatch()
+        .await;
 
     Ok(())
 }
 
-async fn answer(
+async fn handle_command(
     bot: Bot,
     message: Message,
     command: Command,
-    allowed_users: Arc<Vec<String>>,
+    config: Cfg,
+    allowed: Arc<Vec<String>>,
     servers: Arc<Mutex<ServerState>>,
+    olap_store: SharedOlap,
 ) -> ResponseResult<()> {
-    // Получаем username отправителя
     let username = message
         .from
         .and_then(|u| u.username.clone())
         .unwrap_or_default();
 
-    // Проверка доступа ко всем командам, кроме /help
     if let Command::Help = command {
-    } else if !allowed_users.contains(&username) {
+    } else if !allowed.contains(&username) {
         bot.send_message(message.chat.id, "У вас нет доступа к этой команде.")
             .await?;
         return Ok(());
@@ -114,21 +155,33 @@ async fn answer(
             bot.send_message(message.chat.id, "Доступ к тестовой команде разрешен.")
                 .await?;
 
-            let options = vec![InputPollOption::from("Артём")];
+            let mut options: Vec<InlineKeyboardButton> = Vec::new();
 
-            bot.send_poll(message.chat.id, "Какого цвета оранжевый?", options).await?;
+            for map in &servers.lock().await.map {
+                options.push(InlineKeyboardButton::callback(map.0, map.0));
+            }
+
+            let keyboard = InlineKeyboardMarkup::default().append_row(options);
+
+            bot.send_message(message.chat.id, "Выеби своего бойца")
+                .reply_markup(keyboard)
+                .await?;
         }
 
         Command::Today => {
-            let main_config: Cfg = read_to_struct("/etc/iiko-bot/cfg.toml").await.unwrap();
-            let (login, pass) = (main_config.login, main_config.pass);
+            let (login, pass, server_url, current_server) =
+                collect_server_info(servers, config).await;
 
-            let servers = servers.lock().await;
-            let server = servers.map.get(&servers.current).unwrap();
-            let token = auth(login, pass, server).await.unwrap();
-            let shifts = list_shifts_week(&token, server).await.unwrap();
-            logout(&token, server).await.unwrap();
-            let shift = current_shift(&shifts).unwrap();
+            let mut server = Server::new(login, pass, server_url.into());
+
+            let shifts = Server::list_shifts_with_offset(&mut server, Dates::Week, 0)
+                .await
+                .unwrap();
+            server.deauth().await.unwrap();
+
+            let offset: usize = 0;
+            let shift = Server::latest_shift(shifts, offset).unwrap();
+
             let text = format!(
                 "*Сервер*: *{}*\n\
                  *Текущая смена*:\n\
@@ -137,118 +190,119 @@ async fn answer(
                  Оплачено картой: *{}*\n\
                  Оплачено наличкой: *{}*\n\
                  Итог: *{}*",
-                servers.current,
+                current_server,
                 escape(&format_with_dots(shift.session_number)),
                 shift.session_status.to_string(),
                 escape(&format_with_dots(shift.sales_card)),
                 escape(&format_with_dots(shift.sales_cash)),
                 escape(&format_with_dots(shift.pay_orders)),
             );
+
             bot.send_message(message.chat.id, text)
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
 
         Command::Yesterday => {
-            let main_config: Cfg = read_to_struct("/etc/iiko-bot/cfg.toml").await.unwrap();
-            let (login, pass) = (main_config.login, main_config.pass);
+            let (login, pass, server_url, current_server) =
+                collect_server_info(servers, config).await;
 
-            let servers = servers.lock().await;
-            let server = servers.map.get(&servers.current).unwrap();
-            let token = auth(login, pass, server).await.unwrap();
-            let shifts = list_shifts_week(&token, &server).await.unwrap();
-            logout(&token, &server).await.unwrap();
-            let shift = previous_shift(&shifts, 1).unwrap();
+            let mut server = Server::new(login, pass, server_url.into());
+
+            let shifts = Server::list_shifts_with_offset(&mut server, Dates::Week, 0)
+                .await
+                .unwrap();
+            server.deauth().await.unwrap();
+
+            let offset: usize = 1;
+            let shift = Server::latest_shift(shifts, offset).unwrap();
+
             let text = format!(
                 "*Сервер*: *{}*\n\
-                *Предыдущая смена*:\n\
+                 *Предыдущая смена*:\n\
                  Номер смены: *{}*\n\
                  Статус: *{}*\n\
                  Оплачено картой: *{}*\n\
                  Оплачено наличкой: *{}*\n\
                  Итог: *{}*",
-                servers.current,
+                current_server,
                 escape(&format_with_dots(shift.session_number)),
                 shift.session_status.to_string(),
                 escape(&format_with_dots(shift.sales_card)),
                 escape(&format_with_dots(shift.sales_cash)),
                 escape(&format_with_dots(shift.pay_orders)),
             );
+
             bot.send_message(message.chat.id, text)
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
 
         Command::Week => {
-            let main_config: Cfg = read_to_struct("/etc/iiko-bot/cfg.toml").await.unwrap();
-            let (login, pass) = (main_config.login, main_config.pass);
+            let (login, pass, server_url, current_server) =
+                collect_server_info(servers, config).await;
 
-            let servers = servers.lock().await;
-            let server = servers.map.get(&servers.current).unwrap();
+            let mut server = Server::new(login, pass, server_url.into());
 
-            let token = auth(login, pass, server).await.unwrap();
-            let shifts = list_shifts_week(&token, &server).await.unwrap();
+            let shifts = Server::list_shifts_with_offset(&mut server, Dates::Week, 0)
+                .await
+                .unwrap();
+            server.deauth().await.unwrap();
 
-            logout(&token, &server).await.unwrap();
+            let sum = Server::sum_shifts(shifts);
 
-            let sum = sum_shifts(shifts);
             let text = format!(
                 "*Сервер*: *{}*\n*Сумма за прошедшие 7 дней*: *{}*",
-                servers.current,
+                current_server,
                 escape(&format_with_dots(sum))
             );
+
             bot.send_message(message.chat.id, text)
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
 
         Command::Month => {
-            let main_config: Cfg = read_to_struct("/etc/iiko-bot/cfg.toml").await.unwrap();
-            let (login, pass) = (main_config.login, main_config.pass);
+            let (login, pass, server_url, current_server) =
+                collect_server_info(servers, config).await;
 
-            let servers = servers.lock().await;
-            let server = servers.map.get(&servers.current).unwrap();
+            let mut server = Server::new(login, pass, server_url.into());
 
-            let token = auth(login, pass, server).await.unwrap();
-            let shifts = list_shifts_month(&token, &server).await.unwrap();
+            let shifts = Server::list_shifts_with_offset(&mut server, Dates::ThisMonth, 0)
+                .await
+                .unwrap();
+            server.deauth().await.unwrap();
 
-            logout(&token, &server).await.unwrap();
+            let sum = Server::sum_shifts(shifts);
 
-            let sum = sum_shifts(shifts);
             let text = format!(
                 "*Сервер*: *{}*\n*Сумма за текущий месяц*: *{}*",
-                servers.current,
+                current_server,
                 escape(&format_with_dots(sum))
             );
+
             bot.send_message(message.chat.id, text)
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
 
-        Command::Switch { alias } => {
-            let mut server = servers.lock().await;
+        Command::Switch => {
+            let mut options: Vec<InlineKeyboardButton> = Vec::new();
 
-            if let Some(url) = server.map.get(&alias).cloned() {
-                server.current = alias.clone();
-                bot.send_message(
-                    message.chat.id,
-                    format!("Текущий сервер теперь '{}' -> {}", alias, url),
-                )
-                .await?;
-            } else {
-                let text = server
-                    .map
-                    .iter()
-                    .map(|(alias, url)| format!("{} -> {}", alias, url))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+            let server = servers.lock().await;
 
-                let error = format!("Неизвестный псевдоним *{}*\n*Доступные*:\n", alias);
-
-                bot.send_message(message.chat.id, format!("{}{}", error, escape(&text)))
-                    .parse_mode(ParseMode::MarkdownV2)
-                    .await?;
+            for map in &server.map {
+                options.push(InlineKeyboardButton::callback(map.0, map.0));
             }
+
+            let keyboard = InlineKeyboardMarkup::default().append_row(options);
+
+            let text = format!("Текущий сервер: *{}*", server.current);
+
+            bot.send_message(message.chat.id, text)
+                .parse_mode(ParseMode::MarkdownV2)
+                .reply_markup(keyboard)
+                .await?;
         }
 
         Command::List => {
@@ -266,11 +320,112 @@ async fn answer(
                 escape(&text),
                 servers.lock().await.current
             );
+
             bot.send_message(message.chat.id, text)
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
-    }
 
+        Command::Olap => {
+            let (login, pass, server_url, current_server) =
+                collect_server_info(servers.clone(), config.clone()).await;
+            let mut server = Server::new(login, pass, server_url.clone().into());
+
+            let form = ReportConfig {
+                report_type: ReportType::Sales,
+                group_by_row_fields: vec!["DishCategory".into()],
+                group_by_col_fields: vec!["DishName".into()],
+                aggregate_fields: vec!["GuestNum".into(), "DishDiscountSumInt".into()],
+                filters: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "OpenDate.Typed".into(),
+                        Filter::DateRange {
+                            periodType: PeriodType::CURRENT_MONTH,
+                            to: moscow_time().0,
+                        },
+                    );
+                    m.insert(
+                        "DeletedWithWriteoff".into(),
+                        Filter::IncludeValues {
+                            values: vec!["NOT_DELETED".into()],
+                        },
+                    );
+                    m.insert(
+                        "OrderDeleted".into(),
+                        Filter::IncludeValues {
+                            values: vec!["NOT_DELETED".into()],
+                        },
+                    );
+                    m
+                },
+            };
+            let form_json = serde_json::to_string_pretty(&form).unwrap();
+
+            let olap = Server::get_olap(form_json, server_url, server.get_token().await.unwrap())
+                .await
+                .unwrap_or_default();
+            server.deauth().await.unwrap();
+
+            *olap_store.lock().await = olap.clone();
+
+            if olap.is_empty() {
+                bot.send_message(message.chat.id, "По вашим фильтрам ничего не найдено.")
+                    .await?;
+                return Ok(());
+            }
+
+            let rows: Vec<Vec<InlineKeyboardButton>> = olap
+                .keys()
+                .map(|key| vec![InlineKeyboardButton::callback(key.clone(), key.clone())])
+                .collect();
+            let keyboard = InlineKeyboardMarkup::new(rows);
+
+            let text = escape(&format!(
+                "Режим Olap отчёта. Текущий сервер: {}",
+                current_server
+            ));
+
+            match bot
+                .send_message(message.chat.id, text)
+                .parse_mode(ParseMode::MarkdownV2)
+                .reply_markup(keyboard)
+                .await
+            {
+                Ok(_) => (),
+                Err(e) => eprintln!("{:?}", e),
+            };
+        }
+    }
+    Ok(())
+}
+
+async fn handle_callback(
+    bot: Bot,
+    query: CallbackQuery,
+    servers: Arc<Mutex<ServerState>>,
+    olap_store: SharedOlap,
+) -> ResponseResult<()> {
+    if let (Some(data), Some(message)) = (query.data.clone(), query.message.clone()) {
+        let mut server = servers.lock().await;
+
+        if let Some(url) = server.map.get(&data).cloned() {
+            server.current = data.clone();
+            bot.send_message(
+                message.chat().id,
+                format!("Текущий сервер теперь '{}' -> {}", data, url),
+            )
+            .await?;
+        }
+
+        let olap = olap_store.lock().await;
+        if let Some(olap_elements) = olap.get(&data) {
+            let text = Server::display_olap(&olap_elements);
+
+            bot.send_message(message.chat().id, text)
+                .parse_mode(ParseMode::MarkdownV2)
+                .await?;
+        }
+    }
     Ok(())
 }

@@ -1,18 +1,13 @@
 mod date;
 mod make_url;
-mod tg;
+mod new;
 mod shared;
+mod tg;
+mod olap;
 
-use date::{moscow_last_, moscow_time};
-use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
-use std::{
-    collections::HashMap,
-    error::Error,
-    fmt::Display,
-    time::{self, Duration, Instant},
-};
+use std::{collections::HashMap, error::Error, fmt::Display};
 use tg::*;
 
 #[tokio::main]
@@ -21,66 +16,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-struct Token {
-    token: String,
-    time: Instant,
-    lifetime: Duration,
-}
-
-impl Token {
-    fn is_expired(&self) -> bool {
-        self.time.elapsed() >= self.lifetime
-    }
-}
-
-async fn auth(login: String, pass: String, server: &String) -> Result<Token, Box<dyn Error>> {
-    let url = make_url::default(server, &["auth"]);
-
-    let response = Client::new()
-        .get(&url)
-        .query(&[("login", login), ("pass", sha1sum(pass))])
-        .send()
-        .await?;
-
-    let status = response.status();
-
-    let token = match status {
-        StatusCode::OK => response.text().await?,
-        StatusCode::FORBIDDEN => return Err(format!("Доступ к пути {url} запрещён").into()),
-        StatusCode::BAD_REQUEST => {
-            return Err(format!("Неверный запрос: {}\n{:#?}", url, response.text().await?).into());
-        }
-        other => return Err(format!("{}", other).into()),
-    };
-
-    let token = Token {
-        token,
-        time: time::Instant::now(),
-        lifetime: Duration::from_secs(3600),
-    };
-
-    Ok(token)
-}
-
-async fn logout(token: &Token, server: &String) -> Result<(), Box<dyn Error>> {
-    if token.is_expired() {
-        return Err(format!("Токен {} уже истёк", token.token).into());
-    }
-
-    let url = make_url::default(server, &["logout"]);
-
-    Client::new()
-        .get(url)
-        .query(&[("key", token.token.clone())])
-        .send()
-        .await?
-        .text()
-        .await?;
-
-    Ok(())
-}
-
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Cfg {
     login: String,
     pass: String,
@@ -92,8 +28,8 @@ struct ServerState {
     current: String,
 }
 
-fn sha1sum(pass: String) -> String {
-    format!("{:x}", Sha1::digest(pass.as_bytes()))
+fn sha1sum<S: AsRef<str>>(pass: S) -> String {
+    format!("{:x}", Sha1::digest(pass.as_ref().as_bytes()))
 }
 
 #[allow(dead_code)]
@@ -145,64 +81,3 @@ impl Display for SessionStatus {
 }
 
 type Shifts = Vec<Shift>;
-
-async fn list_shifts_week(token: &Token, server: &String) -> Result<Shifts, Box<dyn Error>> {
-    let url = make_url::default(server, &["v2", "cashshifts", "list"]);
-
-    let response = Client::new()
-        .get(url)
-        .query(&[
-            ("openDateFrom", moscow_last_(6)),
-            ("openDateTo", moscow_time().0),
-            ("status", "ANY".to_string()),
-            ("key", token.token.clone()),
-        ])
-        .send()
-        .await?
-        .text()
-        .await?;
-
-    let parsed: Shifts = serde_json::from_str(&response)?;
-
-    Ok(parsed)
-}
-
-async fn list_shifts_month(token: &Token, server: &String) -> Result<Shifts, Box<dyn Error>> {
-    let url = make_url::default(server, &["v2", "cashshifts", "list"]);
-
-    let response = Client::new()
-        .get(url)
-        .query(&[
-            ("openDateFrom", moscow_last_(moscow_time().1 - 1)),
-            ("openDateTo", moscow_time().0),
-            ("status", "ANY".to_string()),
-            ("key", token.token.clone()),
-        ])
-        .send()
-        .await?
-        .text()
-        .await?;
-
-    let parsed: Shifts = serde_json::from_str(&response)?;
-
-    Ok(parsed)
-}
-
-fn current_shift(shifts: &Shifts) -> Result<Shift, Box<dyn Error>> {
-    shifts
-        .last()
-        .cloned()
-        .ok_or("Невозможно получить текущую смену".into())
-}
-
-fn previous_shift(shifts: &Shifts, offset: usize) -> Result<Shift, Box<dyn Error>> {
-    shifts
-        .into_iter()
-        .cloned()
-        .nth(shifts.len() - offset - 1)
-        .ok_or_else(|| format!("Нет смены со сдвигом {}", offset).into())
-}
-
-fn sum_shifts(shifts: Shifts) -> usize {
-    shifts.iter().map(|shift| shift.pay_orders).sum()
-}

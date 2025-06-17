@@ -16,5 +16,5 @@ toml = "0.8.23"
 [profile.release]
 strip = true
 lto = true
-codegen-units = 8
+codegen-units = 1
 opt-level = 3
