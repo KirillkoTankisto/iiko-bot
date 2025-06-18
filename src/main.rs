@@ -1,9 +1,9 @@
 mod date;
 mod make_url;
 mod new;
+mod olap;
 mod shared;
 mod tg;
-mod olap;
 
 use serde::Deserialize;
 use sha1::{Digest, Sha1};

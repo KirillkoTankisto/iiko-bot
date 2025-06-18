@@ -478,8 +478,8 @@ async fn handle_command(
                     .collect();
 
                 let rows: Vec<Vec<InlineKeyboardButton>> = buttons
-                    .chunks(2) // create slices of up to 2 items
-                    .map(|chunk| chunk.to_vec()) // turn each slice into a Vec<Button>
+                    .chunks(2)
+                    .map(|chunk| chunk.to_vec())
                     .collect();
 
                 let keyboard = InlineKeyboardMarkup::new(rows);

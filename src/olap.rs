@@ -67,13 +67,8 @@ pub enum PeriodType {
 #[serde(tag = "filterType")]
 #[allow(non_snake_case)]
 pub enum Filter {
-    DateRange {
-        periodType: PeriodType,
-        to: String,
-    },
-    IncludeValues {
-        values: Vec<String>,
-    },
+    DateRange { periodType: PeriodType, to: String },
+    IncludeValues { values: Vec<String> },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
