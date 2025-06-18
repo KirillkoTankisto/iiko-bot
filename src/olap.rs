@@ -46,16 +46,15 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "UPPERCASE")]
 pub enum ReportType {
-    Sales,
+    SALES,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "PascalCase")]
+#[allow(non_camel_case_types)]
 pub enum FilterType {
-    DateRange,
-    IncludeValues,
+    dateRange,
+    includeValues,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

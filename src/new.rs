@@ -156,7 +156,7 @@ impl GetShifts for Server {
             .ok_or_else(|| format!("Нет смены со сдвигом {}", offset).into())
     }
 
-    fn sum_shifts(shifts: Shifts) -> usize {
+    fn sum_shifts(shifts: Shifts) -> f64 {
         shifts.iter().map(|shift| shift.pay_orders).sum()
     }
 }
@@ -171,7 +171,7 @@ pub trait GetShifts {
     fn latest_shift<Num: Into<usize>>(shifts: Shifts, offset: Num)
     -> Result<Shift, Box<dyn Error>>;
 
-    fn sum_shifts(shifts: Shifts) -> usize;
+    fn sum_shifts(shifts: Shifts) -> f64;
 }
 
 #[derive(Clone)]
@@ -227,12 +227,16 @@ impl Olap for Server {
     fn display_olap(elements: &[OlapElement]) -> String {
         let headers = ["Название", "Сумма", "Заказы"];
 
+        let mut sorted: Vec<&OlapElement> = elements.iter().collect();
+        sorted.sort_by(|a, b| b.GuestNum.cmp(&a.GuestNum));
+        let displayed = sorted.into_iter().take(20).collect::<Vec<_>>();
+
         let mut widths = headers
             .iter()
             .map(|h| h.chars().count())
             .collect::<Vec<usize>>();
 
-        for element in elements {
+        for element in &displayed {
             widths[0] = widths[0].max(element.DishName.chars().count().min(15));
             widths[1] = widths[1].max(element.DishDiscountSumInt.to_string().len());
             widths[2] = widths[2].max(element.GuestNum.to_string().len());
@@ -272,13 +276,12 @@ impl Olap for Server {
         table.push('\n');
         table.push_str(&draw_border('├', '─', '┼', '┤'));
 
-        for (idx, element) in elements.iter().enumerate() {
+        for (idx, element) in displayed.iter().enumerate() {
             let name_lines = wrap_text(&element.DishName, widths[0]);
             for (line_idx, line) in name_lines.into_iter().enumerate() {
                 table.push('│');
 
                 let pad_right = widths[0] + 2 - 1 - line.chars().count();
-
                 table.push(' ');
                 table.push_str(&line);
                 table.push_str(&" ".repeat(pad_right));
@@ -304,7 +307,7 @@ impl Olap for Server {
 
                 table.push('\n');
             }
-            if idx + 1 != elements.len() {
+            if idx + 1 != displayed.len() {
                 table.push_str(&draw_border('├', '─', '┼', '┤'));
             }
         }

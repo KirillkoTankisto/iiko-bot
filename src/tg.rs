@@ -9,9 +9,9 @@ use std::{error::Error, sync::Arc};
 use serde::Deserialize;
 
 use teloxide::dispatching::{HandlerExt, UpdateFilterExt};
-use teloxide::payloads::SendMessageSetters;
-use teloxide::prelude::{Dispatcher, Requester, ResponseResult};
-use teloxide::types::Update;
+use teloxide::payloads::{SendMessageSetters, SetChatMenuButtonSetters};
+use teloxide::prelude::{Dispatcher, Request, Requester, ResponseResult};
+use teloxide::types::{BotCommand, Update};
 use teloxide::{Bot, dptree};
 use teloxide::{
     types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, ParseMode},
@@ -62,6 +62,8 @@ struct TgCfg {
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "Поддерживаемые команды:")]
 enum Command {
+    #[command(description = "Запустить бота")]
+    Start,
     #[command(description = "Отобразить список команд")]
     Help,
     #[command(description = "Тестовая команда")]
@@ -146,6 +148,26 @@ async fn handle_command(
     }
 
     match command {
+        Command::Start => {
+            let commands: Vec<BotCommand> = Command::bot_commands();
+
+            bot.set_my_commands(commands).await?;
+
+            match bot
+                .set_chat_menu_button()
+                .chat_id(message.chat.id)
+                .menu_button(teloxide::types::MenuButton::Commands)
+                .send()
+                .await
+            {
+                Ok(_) => (),
+                Err(e) => eprintln!("{e}"),
+            };
+
+            bot.send_message(message.chat.id, "Я - Iiko бот для отчётов")
+                .await?;
+        }
+
         Command::Help => {
             bot.send_message(message.chat.id, Command::descriptions().to_string())
                 .await?;
@@ -181,9 +203,9 @@ async fn handle_command(
                 current_server,
                 escape(&format_with_dots(shift.session_number)),
                 shift.session_status.to_string(),
-                escape(&format_with_dots(shift.sales_card)),
+                escape(&format_with_dots(shift.sales_card as usize)),
                 escape(&format_with_dots(shift.sales_cash)),
-                escape(&format_with_dots(shift.pay_orders)),
+                escape(&format_with_dots(shift.pay_orders as usize)),
             );
 
             bot.send_message(message.chat.id, text)
@@ -216,9 +238,9 @@ async fn handle_command(
                 current_server,
                 escape(&format_with_dots(shift.session_number)),
                 shift.session_status.to_string(),
-                escape(&format_with_dots(shift.sales_card)),
+                escape(&format_with_dots(shift.sales_card as usize)),
                 escape(&format_with_dots(shift.sales_cash)),
-                escape(&format_with_dots(shift.pay_orders)),
+                escape(&format_with_dots(shift.pay_orders as usize)),
             );
 
             bot.send_message(message.chat.id, text)
@@ -242,7 +264,7 @@ async fn handle_command(
             let text = format!(
                 "*Сервер*: *{}*\n*Сумма за прошедшие 7 дней*: *{}*",
                 current_server,
-                escape(&format_with_dots(sum))
+                escape(&format_with_dots(sum as usize))
             );
 
             bot.send_message(message.chat.id, text)
@@ -266,7 +288,7 @@ async fn handle_command(
             let text = format!(
                 "*Сервер*: *{}*\n*Сумма за текущий месяц*: *{}*",
                 current_server,
-                escape(&format_with_dots(sum))
+                escape(&format_with_dots(sum as usize))
             );
 
             bot.send_message(message.chat.id, text)
@@ -323,7 +345,7 @@ async fn handle_command(
             let mut server = Server::new(login, pass, server_url.clone().into());
 
             let form = ReportConfig {
-                report_type: ReportType::Sales,
+                report_type: ReportType::SALES,
                 group_by_row_fields: vec!["DishCategory".into()],
                 group_by_col_fields: vec!["DishName".into()],
                 aggregate_fields: vec!["GuestNum".into(), "DishDiscountSumInt".into()],
@@ -366,10 +388,16 @@ async fn handle_command(
                 return Ok(());
             }
 
-            let rows: Vec<Vec<InlineKeyboardButton>> = olap
+            let buttons: Vec<InlineKeyboardButton> = olap
                 .keys()
-                .map(|key| vec![InlineKeyboardButton::callback(key.clone(), key.clone())])
+                .map(|key| InlineKeyboardButton::callback(key.clone(), key.clone()))
                 .collect();
+
+            let rows: Vec<Vec<InlineKeyboardButton>> = buttons
+                .chunks(2) // create slices of up to 2 items
+                .map(|chunk| chunk.to_vec()) // turn each slice into a Vec<Button>
+                .collect();
+
             let keyboard = InlineKeyboardMarkup::new(rows);
 
             let text = escape(&format!(
