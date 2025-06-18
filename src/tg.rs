@@ -6,7 +6,7 @@ use crate::{Cfg, ServerState, shared::read_to_struct};
 use std::collections::HashMap;
 use std::{error::Error, sync::Arc};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use teloxide::dispatching::{HandlerExt, UpdateFilterExt};
 use teloxide::payloads::{SendMessageSetters, SetChatMenuButtonSetters};
@@ -19,6 +19,8 @@ use teloxide::{
     utils::markdown::escape,
 };
 
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 type SharedOlap = Arc<Mutex<OlapMap>>;
@@ -53,10 +55,11 @@ async fn collect_server_info(
     (login, pass, server_url, servers.current.clone())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct TgCfg {
     token: String,
     accounts: Vec<String>,
+    admins: Vec<String>,
 }
 
 #[derive(BotCommands, Clone)]
@@ -82,12 +85,26 @@ enum Command {
     List,
     #[command(description = "Режим Olap отчёта")]
     Olap,
+    #[command(description = "Добавить пользователя")]
+    Adduser(String),
+    #[command(description = "Удалить пользователя")]
+    Deleteuser,
+    #[command(description = "Добавить пользователя")]
+    Listusers,
+    #[command(description = "Добавить пользователя")]
+    Listadmins,
 }
 
 pub async fn initialise() -> Result<(), Box<dyn Error>> {
     let telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await?;
-    let (token, accounts) = (telegram_config.token, telegram_config.accounts);
-    let allowed = Arc::new(accounts);
+    let (token, accounts, admins) = (
+        telegram_config.token,
+        telegram_config.accounts,
+        telegram_config.admins,
+    );
+
+    let allowed = Arc::new(Mutex::new(accounts));
+    let admins = Arc::new(admins);
 
     let main_config: Cfg = read_to_struct("/etc/iiko-bot/cfg.toml").await?;
     let servers = main_config.servers.clone();
@@ -116,6 +133,7 @@ pub async fn initialise() -> Result<(), Box<dyn Error>> {
         .dependencies(dptree::deps![
             main_config.clone(),
             allowed.clone(),
+            admins.clone(),
             servers.clone(),
             olap_store.clone()
         ])
@@ -131,7 +149,8 @@ async fn handle_command(
     message: Message,
     command: Command,
     config: Cfg,
-    allowed: Arc<Vec<String>>,
+    allowed: Arc<Mutex<Vec<String>>>,
+    admins: Arc<Vec<String>>,
     servers: Arc<Mutex<ServerState>>,
     olap_store: SharedOlap,
 ) -> ResponseResult<()> {
@@ -141,7 +160,7 @@ async fn handle_command(
         .unwrap_or_default();
 
     if let Command::Help = command {
-    } else if !allowed.contains(&username) {
+    } else if !allowed.lock().await.contains(&username) & !admins.contains(&username) {
         bot.send_message(message.chat.id, "У вас нет доступа к этой команде.")
             .await?;
         return Ok(());
@@ -400,10 +419,7 @@ async fn handle_command(
 
             let keyboard = InlineKeyboardMarkup::new(rows);
 
-            let text = escape(&format!(
-                "Режим Olap отчёта. Текущий сервер: {}",
-                current_server
-            ));
+            let text = format!("Режим Olap отчёта\\. Текущий сервер: *{}*", current_server);
 
             match bot
                 .send_message(message.chat.id, text)
@@ -415,7 +431,87 @@ async fn handle_command(
                 Err(e) => eprintln!("{:?}", e),
             };
         }
+        _ => {}
     }
+
+    if admins.contains(&username) {
+        match command {
+            Command::Adduser(username) => {
+                if username.is_empty() {
+                    bot.send_message(message.chat.id, "Вы не ввели имя пользователя.")
+                        .await?;
+                    return Ok(());
+                }
+
+                let stripped = username.strip_prefix('@').unwrap_or(&username);
+
+                {
+                    let mut accounts = allowed.lock().await;
+                    if !accounts.contains(&stripped.to_string()) {
+                        accounts.push(stripped.to_string());
+                    }
+                }
+
+                let mut telegram_config: TgCfg =
+                    read_to_struct("/etc/iiko-bot/tg_cfg.toml").await.unwrap();
+
+                telegram_config.accounts.push(stripped.into());
+
+                let mut file = fs::File::create("/etc/iiko-bot/tg_cfg.toml").await.unwrap();
+
+                let config = toml::to_string(&telegram_config).unwrap();
+
+                file.write_all(config.as_bytes()).await.unwrap();
+            }
+            Command::Deleteuser => {
+                let accounts = allowed.lock().await;
+
+                let buttons: Vec<InlineKeyboardButton> = accounts
+                    .iter()
+                    .cloned()
+                    .map(|account| {
+                        InlineKeyboardButton::callback(
+                            format!("@{}", account.clone()),
+                            account.clone(),
+                        )
+                    })
+                    .collect();
+
+                let rows: Vec<Vec<InlineKeyboardButton>> = buttons
+                    .chunks(2) // create slices of up to 2 items
+                    .map(|chunk| chunk.to_vec()) // turn each slice into a Vec<Button>
+                    .collect();
+
+                let keyboard = InlineKeyboardMarkup::new(rows);
+
+                let text = format!("Выберите аккаунт для удаления");
+
+                match bot
+                    .send_message(message.chat.id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .reply_markup(keyboard)
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(e) => eprintln!("{:?}", e),
+                };
+            }
+            Command::Listusers => {
+                let accounts = allowed.lock().await;
+
+                let list = accounts.iter().cloned().collect::<Vec<String>>().join("\n");
+
+                let text = format!("Список пользователей:\n{}", list);
+
+                bot.send_message(message.chat.id, text)
+                    .parse_mode(ParseMode::MarkdownV2)
+                    .await?;
+            }
+            Command::Listadmins => {}
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -423,6 +519,7 @@ async fn handle_callback(
     bot: Bot,
     query: CallbackQuery,
     servers: Arc<Mutex<ServerState>>,
+    allowed: Arc<Mutex<Vec<String>>>,
     olap_store: SharedOlap,
 ) -> ResponseResult<()> {
     if let (Some(data), Some(message)) = (query.data.clone(), query.message.clone()) {
@@ -445,6 +542,25 @@ async fn handle_callback(
                 .parse_mode(ParseMode::MarkdownV2)
                 .await?;
         }
+
+        let mut accounts = allowed.lock().await;
+
+        if accounts.contains(&data) {
+            accounts.retain(|account| account != &data);
+
+            let mut telegram_config: TgCfg =
+                read_to_struct("/etc/iiko-bot/tg_cfg.toml").await.unwrap();
+
+            telegram_config.accounts.retain(|account| account != &data);
+
+            let mut file = fs::File::create("/etc/iiko-bot/tg_cfg.toml").await.unwrap();
+
+            let config = toml::to_string(&telegram_config).unwrap();
+
+            file.write_all(config.as_bytes()).await.unwrap();
+        }
+
+        drop(accounts);
     }
     Ok(())
 }
