@@ -46,6 +46,7 @@ impl Server {
             let response = Client::new()
                 .get(&url)
                 .query(&[("login", &self.login), ("pass", &sha1sum(&self.pass))])
+                .timeout(Duration::from_secs(2))
                 .send()
                 .await?;
 
@@ -72,6 +73,7 @@ impl Server {
             Client::new()
                 .get(url)
                 .query(&[("key", self.token.clone().unwrap().id.clone())])
+                .timeout(Duration::from_secs(2))
                 .send()
                 .await?
                 .text()
@@ -127,6 +129,7 @@ impl GetShifts for Server {
                 ("status", "ANY".to_string()),
                 ("key", server.token.clone().unwrap().id),
             ])
+            .timeout(Duration::from_secs(2))
             .send()
             .await?
             .text()

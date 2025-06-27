@@ -23,5 +23,7 @@ pub fn default(server: &String, path: &[&str]) -> String {
         string.push_str(&element);
     }
 
+    println!("{string}");
+
     string
 }
