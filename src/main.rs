@@ -8,7 +8,8 @@ mod tg;
 use serde::Deserialize;
 use sha1::{Digest, Sha1};
 use std::{collections::HashMap, error::Error, fmt::Display};
-use tg::*;
+
+use crate::tg::initialise;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {

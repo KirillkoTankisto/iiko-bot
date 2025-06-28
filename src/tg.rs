@@ -3,11 +3,17 @@ use crate::iiko::{Dates, GetShifts, Olap, Server};
 use crate::olap::{Filter, OlapMap, PeriodType, ReportConfig, ReportType};
 use crate::{Cfg, ServerState, shared::read_to_struct};
 
+//
+
 use std::collections::HashMap;
 use std::vec;
 use std::{error::Error, sync::Arc};
 
+//
+
 use serde::{Deserialize, Serialize};
+
+//
 
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::dispatching::{HandlerExt, UpdateFilterExt};
@@ -21,11 +27,70 @@ use teloxide::{
     utils::markdown::escape,
 };
 
+//
+
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+//
+
 type SharedOlap = Arc<Mutex<OlapMap>>;
+type MyDialogue = Dialogue<State, InMemStorage<State>>;
+
+//
+
+#[derive(Deserialize, Serialize)]
+struct TgCfg {
+    token: String,
+    accounts: Vec<String>,
+    admins: Vec<String>,
+}
+
+#[derive(Clone)]
+struct DependenciesForDispatcher {
+    config: Cfg,
+    allowed_list: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+    servers: Arc<Mutex<ServerState>>,
+    olap_store: SharedOlap,
+}
+
+//
+
+#[derive(BotCommands, Clone)]
+#[command(rename_rule = "lowercase", description = "Поддерживаемые команды:")]
+enum Command {
+    #[command(description = "Запустить бота")]
+    Start,
+}
+
+#[derive(Clone, Default)]
+enum State {
+    #[default]
+    None,
+    Switch,
+    Olap,
+    AddUser,
+    DeleteUser,
+    Dialogue,
+    Report,
+    Admin,
+}
+
+//
+
+async fn collect_server_info(
+    servers: Arc<Mutex<ServerState>>,
+    config: Cfg,
+) -> (String, String, String, String) {
+    let (login, pass) = (config.login, config.pass);
+
+    let servers = servers.lock().await;
+    let server_url = servers.map.get(&servers.current).unwrap().to_owned();
+
+    (login, pass, server_url, servers.current.clone())
+}
 
 fn format_with_dots(number: usize) -> String {
     let number_string = number.to_string();
@@ -45,77 +110,15 @@ fn format_with_dots(number: usize) -> String {
     result
 }
 
-async fn collect_server_info(
-    servers: Arc<Mutex<ServerState>>,
-    config: Cfg,
-) -> (String, String, String, String) {
-    let (login, pass) = (config.login, config.pass);
-
-    let servers = servers.lock().await;
-    let server_url = servers.map.get(&servers.current).unwrap().to_owned();
-
-    (login, pass, server_url, servers.current.clone())
+async fn is_allowed(allowed_list: Arc<Mutex<Vec<String>>>, username: &String) -> bool {
+    allowed_list.lock().await.contains(username)
 }
 
-#[derive(Deserialize, Serialize)]
-struct TgCfg {
-    token: String,
-    accounts: Vec<String>,
-    admins: Vec<String>,
+fn is_admin(admins_list: Arc<Vec<String>>, username: &String) -> bool {
+    admins_list.contains(username)
 }
 
-#[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase", description = "Поддерживаемые команды:")]
-enum Command {
-    #[command(description = "Запустить бота")]
-    Start,
-    #[command(description = "Отобразить список команд")]
-    Help,
-    #[command(description = "Сегодняшняя выручка")]
-    Today,
-    #[command(description = "Вчерашняя выручка")]
-    Yesterday,
-    #[command(description = "Выручка за 7 дней")]
-    Week,
-    #[command(description = "Выручка за данный месяц")]
-    Month,
-    #[command(description = "Переключиться на другой сервер")]
-    Switch,
-    #[command(description = "Вывести список доступных серверов")]
-    List,
-    #[command(description = "Режим Olap отчёта")]
-    Olap,
-    #[command(description = "Добавить пользователя")]
-    Adduser,
-    #[command(description = "Удалить пользователя")]
-    Deleteuser,
-    #[command(description = "Список пользователей")]
-    Listusers,
-    #[command(description = "Список админов")]
-    Listadmins,
-}
-
-#[derive(Clone, Default)]
-enum State {
-    #[default]
-    None,
-    Switch,
-    Olap,
-    AddUser,
-    DeleteUser,
-    Dialogue,
-    Report,
-    Admin,
-}
-
-#[derive(Clone)]
-struct DependenciesForDispatcher {
-    config: Cfg,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-    servers: Arc<Mutex<ServerState>>,
-    olap_store: SharedOlap,
-}
+//
 
 pub async fn initialise() -> Result<(), Box<dyn Error>> {
     let telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await?;
@@ -168,12 +171,84 @@ pub async fn initialise() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn is_allowed(allowed_list: Arc<Mutex<Vec<String>>>, username: &String) -> bool {
-    allowed_list.lock().await.contains(username)
-}
+//
 
-fn is_admin(admins_list: Arc<Vec<String>>, username: &String) -> bool {
-    admins_list.contains(username)
+async fn handle_states(
+    bot: Bot,
+    message: Message,
+    dialogue: MyDialogue,
+    deps: DependenciesForDispatcher,
+) -> ResponseResult<()> {
+    if let Some(state) = dialogue.get().await.unwrap_or_default() {
+        let result = match state {
+            State::None => {
+                handle_start(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
+            }
+
+            State::Dialogue => {
+                handle_dialogue(
+                    bot,
+                    message,
+                    dialogue,
+                    deps.servers,
+                    deps.allowed_list,
+                    deps.admins_list,
+                )
+                .await
+            }
+
+            State::Report => handle_reports(bot, message, dialogue, deps.clone()).await,
+
+            State::Olap => {
+                callback_olap(
+                    bot,
+                    message,
+                    deps.olap_store,
+                    dialogue,
+                    deps.allowed_list,
+                    deps.admins_list,
+                )
+                .await
+            }
+
+            State::Switch => {
+                callback_switch(
+                    bot,
+                    message,
+                    deps.servers,
+                    dialogue,
+                    deps.allowed_list,
+                    deps.admins_list,
+                )
+                .await
+            }
+
+            State::Admin => {
+                callback_admin(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
+            }
+
+            State::AddUser => {
+                handle_add_user_dialogue(
+                    bot,
+                    message,
+                    deps.allowed_list,
+                    dialogue,
+                    deps.admins_list,
+                )
+                .await
+            }
+            State::DeleteUser => {
+                callback_delete_user(bot, message, dialogue, deps.allowed_list, deps.admins_list)
+                    .await
+            }
+        };
+
+        if let Err(e) = result {
+            eprintln!("Ошибка: {e}")
+        }
+    };
+
+    Ok(())
 }
 
 async fn handle_start(
@@ -229,6 +304,8 @@ async fn handle_start(
     Ok(())
 }
 
+//
+
 async fn handle_dialogue(
     bot: Bot,
     message: Message,
@@ -259,87 +336,7 @@ async fn handle_dialogue(
     Ok(())
 }
 
-async fn handle_admin(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
-    let username = message
-        .from
-        .clone()
-        .ok_or("Не удалось определить отправителя")?
-        .username
-        .ok_or("Не удалось получить ник")?;
-
-    if !is_admin(admins_list.clone(), &username) {
-        bot.send_message(message.chat.id, "Вы не находитесь в списке админов")
-            .await?;
-        handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
-        return Ok(());
-    };
-
-    let buttons: Vec<KeyboardButton> = vec![
-        KeyboardButton::new("Добавить пользователя"),
-        KeyboardButton::new("Удалить пользователя"),
-    ];
-
-    let buttons2: Vec<KeyboardButton> = vec![
-        KeyboardButton::new("Список пользователей"),
-        KeyboardButton::new("Список админов"),
-    ];
-
-    let buttons3: Vec<KeyboardButton> = vec![KeyboardButton::new("Назад")];
-
-    let keyboard = KeyboardMarkup::default()
-        .append_row(buttons)
-        .append_row(buttons2)
-        .append_row(buttons3)
-        .one_time_keyboard();
-
-    bot.send_message(message.chat.id, "Выберите опцию")
-        .reply_markup(keyboard)
-        .await?;
-
-    dialogue.update(State::Admin).await?;
-
-    Ok(())
-}
-
-async fn callback_admin(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
-    if let Some(text) = message.text() {
-        match text {
-            "Добавить пользователя" => {
-                handle_add_user(bot, message, dialogue).await?
-            }
-
-            "Удалить пользователя" => {
-                handle_delete_user(bot, message, allowed_list, dialogue).await?
-            }
-
-            "Список пользователей" => {
-                handle_list_users(bot, message, dialogue, allowed_list, admins_list).await?
-            }
-
-            "Список админов" => {
-                handle_list_admins(bot, message, dialogue, allowed_list, admins_list).await?
-            }
-
-            "Назад" => handle_start(bot, message, dialogue, allowed_list, admins_list).await?,
-
-            _ => {}
-        };
-    }
-
-    Ok(())
-}
+//
 
 async fn list_reports(
     bot: Bot,
@@ -455,75 +452,7 @@ async fn handle_reports(
     Ok(())
 }
 
-async fn handle_states(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    deps: DependenciesForDispatcher,
-) -> ResponseResult<()> {
-    let state = dialogue.get().await.unwrap().unwrap();
-
-    let result = match state {
-        State::AddUser => {
-            handle_add_user_dialogue(bot, message, deps.allowed_list, dialogue, deps.admins_list)
-                .await
-        }
-        State::DeleteUser => {
-            callback_delete_user(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
-        }
-
-        State::Olap => {
-            callback_olap(
-                bot,
-                message,
-                deps.olap_store,
-                dialogue,
-                deps.allowed_list,
-                deps.admins_list,
-            )
-            .await
-        }
-
-        State::Switch => {
-            callback_switch(
-                bot,
-                message,
-                deps.servers,
-                dialogue,
-                deps.allowed_list,
-                deps.admins_list,
-            )
-            .await
-        }
-
-        State::Dialogue => {
-            handle_dialogue(
-                bot,
-                message,
-                dialogue,
-                deps.servers,
-                deps.allowed_list,
-                deps.admins_list,
-            )
-            .await
-        }
-
-        State::Report => handle_reports(bot, message, dialogue, deps.clone()).await,
-
-        State::Admin => {
-            callback_admin(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
-        }
-        State::None => {
-            handle_start(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
-        }
-    };
-
-    if let Err(e) = result {
-        eprintln!("Ошибка: {e}")
-    }
-
-    Ok(())
-}
+//
 
 async fn handle_today(
     bot: Bot,
@@ -661,6 +590,8 @@ async fn handle_month(
     Ok(())
 }
 
+//
+
 async fn handle_switch(
     bot: Bot,
     message: Message,
@@ -690,6 +621,38 @@ async fn handle_switch(
 
     Ok(())
 }
+
+async fn callback_switch(
+    bot: Bot,
+    message: Message,
+    servers: Arc<Mutex<ServerState>>,
+    dialogue: MyDialogue,
+    allowed_list: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+) -> Result<(), Box<dyn Error>> {
+    let data = message
+        .text()
+        .ok_or("Невозможно получить текст сообщения")?;
+
+    let mut server = servers.lock().await;
+
+    if let Some(url) = server.map.get(data).cloned() {
+        server.current = data.to_string();
+        bot.send_message(
+            message.chat.id,
+            format!("Текущий сервер теперь '{}' -> {}", data, url),
+        )
+        .await?;
+    }
+
+    dialogue.update(State::None).await?;
+
+    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
+
+    Ok(())
+}
+
+//
 
 async fn handle_list(
     bot: Bot,
@@ -722,6 +685,8 @@ async fn handle_list(
 
     Ok(())
 }
+
+//
 
 async fn handle_olap(
     bot: Bot,
@@ -802,11 +767,120 @@ async fn handle_olap(
     Ok(())
 }
 
-/*
-    Дальше идут команды для админов
-*/
+async fn callback_olap(
+    bot: Bot,
+    message: Message,
+    olap_store: SharedOlap,
+    dialogue: MyDialogue,
+    allowed_list: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+) -> Result<(), Box<dyn Error>> {
+    let data = message
+        .text()
+        .ok_or("Невозможно получить текст сообщения")?;
 
-// /adduser, здесь несколько функций
+    let olap = olap_store.lock().await;
+
+    if let Some(olap_elements) = olap.get(data) {
+        let text = Server::display_olap(&olap_elements);
+
+        bot.send_message(message.chat.id, text)
+            .parse_mode(ParseMode::MarkdownV2)
+            .await?;
+    }
+
+    dialogue.update(State::None).await?;
+
+    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
+
+    Ok(())
+}
+
+//
+
+async fn handle_admin(
+    bot: Bot,
+    message: Message,
+    dialogue: MyDialogue,
+    allowed_list: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+) -> Result<(), Box<dyn Error>> {
+    let username = message
+        .from
+        .clone()
+        .ok_or("Не удалось определить отправителя")?
+        .username
+        .ok_or("Не удалось получить ник")?;
+
+    if !is_admin(admins_list.clone(), &username) {
+        bot.send_message(message.chat.id, "Вы не находитесь в списке админов")
+            .await?;
+        handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
+        return Ok(());
+    };
+
+    let buttons: Vec<KeyboardButton> = vec![
+        KeyboardButton::new("Добавить пользователя"),
+        KeyboardButton::new("Удалить пользователя"),
+    ];
+
+    let buttons2: Vec<KeyboardButton> = vec![
+        KeyboardButton::new("Список пользователей"),
+        KeyboardButton::new("Список админов"),
+    ];
+
+    let buttons3: Vec<KeyboardButton> = vec![KeyboardButton::new("Назад")];
+
+    let keyboard = KeyboardMarkup::default()
+        .append_row(buttons)
+        .append_row(buttons2)
+        .append_row(buttons3)
+        .one_time_keyboard();
+
+    bot.send_message(message.chat.id, "Выберите опцию")
+        .reply_markup(keyboard)
+        .await?;
+
+    dialogue.update(State::Admin).await?;
+
+    Ok(())
+}
+
+async fn callback_admin(
+    bot: Bot,
+    message: Message,
+    dialogue: MyDialogue,
+    allowed_list: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(text) = message.text() {
+        match text {
+            "Добавить пользователя" => {
+                handle_add_user(bot, message, dialogue).await?
+            }
+
+            "Удалить пользователя" => {
+                handle_delete_user(bot, message, allowed_list, dialogue).await?
+            }
+
+            "Список пользователей" => {
+                handle_list_users(bot, message, dialogue, allowed_list, admins_list).await?
+            }
+
+            "Список админов" => {
+                handle_list_admins(bot, message, dialogue, allowed_list, admins_list).await?
+            }
+
+            "Назад" => handle_start(bot, message, dialogue, allowed_list, admins_list).await?,
+
+            _ => {}
+        };
+    }
+
+    Ok(())
+}
+
+//
 
 async fn handle_add_user(
     bot: Bot,
@@ -820,8 +894,6 @@ async fn handle_add_user(
 
     Ok(())
 }
-
-type MyDialogue = Dialogue<State, InMemStorage<State>>;
 
 async fn handle_add_user_dialogue(
     bot: Bot,
@@ -870,7 +942,7 @@ async fn handle_add_user_dialogue(
     Ok(())
 }
 
-// Конец /adduser
+//
 
 async fn handle_delete_user(
     bot: Bot,
@@ -906,6 +978,53 @@ async fn handle_delete_user(
 
     Ok(())
 }
+
+async fn callback_delete_user(
+    bot: Bot,
+    message: Message,
+    dialogue: MyDialogue,
+    allowed: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+) -> Result<(), Box<dyn Error>> {
+    let data = message
+        .text()
+        .ok_or("Невозможно получить текст сообщения")?
+        .to_string();
+
+    let removed = {
+        let mut accounts = allowed.lock().await;
+        if accounts.contains(&data) {
+            accounts.retain(|account| account != &data);
+            true
+        } else {
+            false
+        }
+    };
+
+    if removed {
+        let mut telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await?;
+        telegram_config.accounts.retain(|account| account != &data);
+
+        let mut file = fs::File::create("/etc/iiko-bot/tg_cfg.toml").await?;
+        let config = toml::to_string(&telegram_config)?;
+        file.write_all(config.as_bytes()).await?;
+
+        let text = format!("Пользователь @{} успешно удалён", data);
+        bot.send_message(message.chat.id, text).await?;
+    }
+
+    dialogue.update(State::None).await?;
+
+    let allowed_clone = Arc::clone(&allowed);
+
+    if let Err(e) = handle_start(bot, message, dialogue, allowed_clone, admins_list).await {
+        eprintln!("Ошибка: {e}");
+    }
+
+    Ok(())
+}
+
+//
 
 async fn handle_list_users(
     bot: Bot,
@@ -965,106 +1084,4 @@ async fn handle_list_admins(
     Ok(())
 }
 
-async fn callback_switch(
-    bot: Bot,
-    message: Message,
-    servers: Arc<Mutex<ServerState>>,
-    dialogue: MyDialogue,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
-    let data = message
-        .text()
-        .ok_or("Невозможно получить текст сообщения")?;
-
-    let mut server = servers.lock().await;
-
-    if let Some(url) = server.map.get(data).cloned() {
-        server.current = data.to_string();
-        bot.send_message(
-            message.chat.id,
-            format!("Текущий сервер теперь '{}' -> {}", data, url),
-        )
-        .await?;
-    }
-
-    dialogue.update(State::None).await?;
-
-    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
-
-    Ok(())
-}
-
-async fn callback_olap(
-    bot: Bot,
-    message: Message,
-    olap_store: SharedOlap,
-    dialogue: MyDialogue,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
-    let data = message
-        .text()
-        .ok_or("Невозможно получить текст сообщения")?;
-
-    let olap = olap_store.lock().await;
-
-    if let Some(olap_elements) = olap.get(data) {
-        let text = Server::display_olap(&olap_elements);
-
-        bot.send_message(message.chat.id, text)
-            .parse_mode(ParseMode::MarkdownV2)
-            .await?;
-    }
-
-    dialogue.update(State::None).await?;
-
-    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
-
-    Ok(())
-}
-
-async fn callback_delete_user(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    allowed: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
-    let data = message
-        .text()
-        .ok_or("Невозможно получить текст сообщения")?
-        .to_string();
-
-    let removed = {
-        let mut accounts = allowed.lock().await;
-        if accounts.contains(&data) {
-            accounts.retain(|account| account != &data);
-            true
-        } else {
-            false
-        }
-    };
-
-    if removed {
-        let mut telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await?;
-        telegram_config.accounts.retain(|account| account != &data);
-
-        let mut file = fs::File::create("/etc/iiko-bot/tg_cfg.toml").await?;
-        let config = toml::to_string(&telegram_config)?;
-        file.write_all(config.as_bytes()).await?;
-
-        let text = format!("Пользователь @{} успешно удалён", data);
-        bot.send_message(message.chat.id, text).await?;
-    }
-
-    dialogue.update(State::None).await?;
-
-    let allowed_clone = Arc::clone(&allowed);
-
-    if let Err(e) = handle_start(bot, message, dialogue, allowed_clone, admins_list).await {
-        eprintln!("Ошибка: {e}");
-    }
-
-    Ok(())
-}
+//

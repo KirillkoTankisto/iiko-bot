@@ -16,18 +16,18 @@ use crate::{
     sha1sum,
 };
 
-pub struct Server {
-    login: String,
-    pass: String,
-    url: String,
-    token: Option<NewToken>,
-}
-
 #[allow(dead_code)]
 pub enum Dates {
     Week,
     ThisMonth,
     Custom,
+}
+
+pub struct Server {
+    login: String,
+    pass: String,
+    url: String,
+    token: Option<NewToken>,
 }
 
 impl Server {
@@ -118,6 +118,19 @@ impl Server {
     }
 }
 
+pub trait GetShifts {
+    async fn list_shifts_with_offset<Num: Into<i64>>(
+        server: &mut Server,
+        date: Dates,
+        offset: Num,
+    ) -> Result<Shifts, Box<dyn Error>>;
+
+    fn latest_shift<Num: Into<usize>>(shifts: Shifts, offset: Num)
+    -> Result<Shift, Box<dyn Error>>;
+
+    fn sum_shifts(shifts: Shifts) -> f64;
+}
+
 impl GetShifts for Server {
     async fn list_shifts_with_offset<Num: Into<i64>>(
         server: &mut Self,
@@ -183,30 +196,10 @@ impl GetShifts for Server {
     }
 }
 
-pub trait GetShifts {
-    async fn list_shifts_with_offset<Num: Into<i64>>(
-        server: &mut Server,
-        date: Dates,
-        offset: Num,
-    ) -> Result<Shifts, Box<dyn Error>>;
+pub trait Olap {
+    async fn get_olap(form: String, url: String, key: String) -> Result<OlapMap, Box<dyn Error>>;
 
-    fn latest_shift<Num: Into<usize>>(shifts: Shifts, offset: Num)
-    -> Result<Shift, Box<dyn Error>>;
-
-    fn sum_shifts(shifts: Shifts) -> f64;
-}
-
-#[derive(Clone)]
-struct NewToken {
-    id: String,
-    creation_time: Instant,
-    lifetime: Duration,
-}
-
-impl NewToken {
-    fn is_expired(&self) -> bool {
-        self.creation_time.elapsed() >= self.lifetime
-    }
+    fn display_olap(elements: &[OlapElement]) -> String;
 }
 
 impl Olap for Server {
@@ -348,8 +341,15 @@ impl Olap for Server {
     }
 }
 
-pub trait Olap {
-    async fn get_olap(form: String, url: String, key: String) -> Result<OlapMap, Box<dyn Error>>;
+#[derive(Clone)]
+struct NewToken {
+    id: String,
+    creation_time: Instant,
+    lifetime: Duration,
+}
 
-    fn display_olap(elements: &[OlapElement]) -> String;
+impl NewToken {
+    fn is_expired(&self) -> bool {
+        self.creation_time.elapsed() >= self.lifetime
+    }
 }
