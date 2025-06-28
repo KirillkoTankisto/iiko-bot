@@ -4,7 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use reqwest::Client;
+use reqwest_middleware::ClientBuilder;
+use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
 use serde_json::from_str;
 
 use crate::{
@@ -43,7 +44,13 @@ impl Server {
         if !self.is_authenticated() {
             let url = make_url::default(&self.url, &["auth"]);
 
-            let response = Client::new()
+            let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build();
+
+            let response = client
                 .get(&url)
                 .query(&[("login", &self.login), ("pass", &sha1sum(&self.pass))])
                 .timeout(Duration::from_secs(2))
@@ -70,7 +77,13 @@ impl Server {
         if self.is_authenticated() {
             let url = make_url::default(&self.url, &["logout"]);
 
-            Client::new()
+            let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+
+            let client = ClientBuilder::new(reqwest::Client::new())
+                .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+                .build();
+
+            client
                 .get(url)
                 .query(&[("key", self.token.clone().unwrap().id.clone())])
                 .timeout(Duration::from_secs(2))
@@ -121,7 +134,13 @@ impl GetShifts for Server {
             Dates::Custom => moscow_last_(offset.into()),
         };
 
-        let response = Client::new()
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+
+        let response = client
             .get(url)
             .query(&[
                 ("openDateFrom", date_from),
@@ -198,8 +217,15 @@ impl Olap for Server {
     ) -> Result<OlapMap, Box<dyn Error>> {
         let url = make_url::default(&server_url, &["v2", "reports", "olap"]);
 
-        let response = Client::new()
+        let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
+
+        let client = ClientBuilder::new(reqwest::Client::new())
+            .with(RetryTransientMiddleware::new_with_policy(retry_policy))
+            .build();
+
+        let response = client
             .post(url)
+            .timeout(Duration::from_secs(2))
             .header("Content-Type", "application/json")
             .query(&[("key", &key)])
             .body(form)
