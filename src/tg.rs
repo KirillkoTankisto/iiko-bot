@@ -1,5 +1,5 @@
 use crate::date::moscow_time;
-use crate::new::{Dates, GetShifts, Olap, Server};
+use crate::iiko::{Dates, GetShifts, Olap, Server};
 use crate::olap::{Filter, OlapMap, PeriodType, ReportConfig, ReportType};
 use crate::{Cfg, ServerState, shared::read_to_struct};
 
@@ -9,7 +9,6 @@ use std::{error::Error, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use dptree::case;
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::dispatching::{HandlerExt, UpdateFilterExt};
 use teloxide::payloads::{SendMessageSetters, SetChatMenuButtonSetters};
@@ -109,6 +108,15 @@ enum State {
     Admin,
 }
 
+#[derive(Clone)]
+struct DependenciesForDispatcher {
+    config: Cfg,
+    allowed_list: Arc<Mutex<Vec<String>>>,
+    admins_list: Arc<Vec<String>>,
+    servers: Arc<Mutex<ServerState>>,
+    olap_store: SharedOlap,
+}
+
 pub async fn initialise() -> Result<(), Box<dyn Error>> {
     let telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await?;
     let (token, accounts, admins) = (
@@ -135,39 +143,23 @@ pub async fn initialise() -> Result<(), Box<dyn Error>> {
 
     let bot = Bot::new(token);
 
-    let handler = dptree::entry().branch(
-        Update::filter_message()
-            .enter_dialogue::<Message, InMemStorage<State>, State>()
-            .branch(case![State::AddUser].endpoint(handle_add_user_dialogue_wrapper))
-            .branch(case![State::Switch].endpoint(callback_switch))
-            .branch(case![State::Olap].endpoint(callback_olap))
-            .branch(case![State::DeleteUser].endpoint(callback_delete_user))
-            .branch(case![State::Dialogue].endpoint(handle_dialogue))
-            .branch(case![State::Report].endpoint(handle_reports_wrapper))
-            .branch(case![State::None].endpoint(handle_start_wrapper))
-            .branch(case![State::Admin].endpoint(callback_admin_wrapper))
-            .branch(Update::filter_message().endpoint(
-                |bot: Bot, msg: Message, dialogue: MyDialogue| async move {
-                    bot.send_message(
-                        msg.chat.id,
-                        "Я не понял, попробуйте /help или выберите команду из меню.",
-                    )
-                    .await?;
-                    dialogue.update(State::None).await.unwrap();
-                    Ok::<(), teloxide::RequestError>(())
-                },
-            )),
-    );
+    let handler = Update::filter_message()
+        .enter_dialogue::<Message, InMemStorage<State>, State>()
+        .endpoint(handle_states);
+
+    let deps = DependenciesForDispatcher {
+        config: main_config.clone(),
+        allowed_list: allowed.clone(),
+        admins_list: admins.clone(),
+        servers: servers.clone(),
+        olap_store: olap_store.clone(),
+    };
 
     Dispatcher::builder(bot.clone(), handler)
         .dependencies(dptree::deps![
-            main_config.clone(),
-            allowed.clone(),
-            admins.clone(),
-            servers.clone(),
-            olap_store.clone(),
+            deps.clone(),
             InMemStorage::<State>::new(),
-            State::default()
+            State::None
         ])
         .build()
         .dispatch()
@@ -182,21 +174,6 @@ async fn is_allowed(allowed_list: Arc<Mutex<Vec<String>>>, username: &String) ->
 
 fn is_admin(admins_list: Arc<Vec<String>>, username: &String) -> bool {
     admins_list.contains(username)
-}
-
-async fn handle_start_wrapper(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
-    match handle_start(bot, message, dialogue, allowed_list, admins_list).await {
-        Ok(_) => {}
-        Err(e) => eprintln!("Ошибка {e}"),
-    }
-
-    Ok(())
 }
 
 async fn handle_start(
@@ -259,7 +236,7 @@ async fn handle_dialogue(
     servers: Arc<Mutex<ServerState>>,
     allowed_list: Arc<Mutex<Vec<String>>>,
     admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
+) -> Result<(), Box<dyn Error>> {
     if let Some(text) = message.text() {
         let result = match text {
             "Отчёты" => list_reports(bot, message, dialogue).await,
@@ -268,16 +245,7 @@ async fn handle_dialogue(
                 handle_list(bot, message, dialogue, servers, allowed_list, admins_list).await
             }
             "Администрирование" => {
-                let username = message
-                    .from
-                    .clone()
-                    .ok_or("Не удалось определить отправителя")
-                    .unwrap()
-                    .username
-                    .ok_or("Не удалось получить ник")
-                    .unwrap();
-
-                handle_admin(bot, message, dialogue, allowed_list, admins_list, &username).await
+                handle_admin(bot, message, dialogue, allowed_list, admins_list).await
             }
             _ => handle_start(bot, message, dialogue, allowed_list, admins_list).await,
         };
@@ -297,9 +265,15 @@ async fn handle_admin(
     dialogue: MyDialogue,
     allowed_list: Arc<Mutex<Vec<String>>>,
     admins_list: Arc<Vec<String>>,
-    username: &String,
 ) -> Result<(), Box<dyn Error>> {
-    if !is_admin(admins_list.clone(), username) {
+    let username = message
+        .from
+        .clone()
+        .ok_or("Не удалось определить отправителя")?
+        .username
+        .ok_or("Не удалось получить ник")?;
+
+    if !is_admin(admins_list.clone(), &username) {
         bot.send_message(message.chat.id, "Вы не находитесь в списке админов")
             .await?;
         handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
@@ -316,9 +290,12 @@ async fn handle_admin(
         KeyboardButton::new("Список админов"),
     ];
 
+    let buttons3: Vec<KeyboardButton> = vec![KeyboardButton::new("Назад")];
+
     let keyboard = KeyboardMarkup::default()
         .append_row(buttons)
         .append_row(buttons2)
+        .append_row(buttons3)
         .one_time_keyboard();
 
     bot.send_message(message.chat.id, "Выберите опцию")
@@ -330,37 +307,35 @@ async fn handle_admin(
     Ok(())
 }
 
-async fn callback_admin_wrapper(
+async fn callback_admin(
     bot: Bot,
     message: Message,
     dialogue: MyDialogue,
     allowed_list: Arc<Mutex<Vec<String>>>,
     admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
+) -> Result<(), Box<dyn Error>> {
     if let Some(text) = message.text() {
-        let result = match text {
+        match text {
             "Добавить пользователя" => {
-                handle_add_user(bot, message, dialogue).await
+                handle_add_user(bot, message, dialogue).await?
             }
 
             "Удалить пользователя" => {
-                handle_delete_user(bot, message, allowed_list, dialogue).await
+                handle_delete_user(bot, message, allowed_list, dialogue).await?
             }
 
             "Список пользователей" => {
-                handle_list_users(bot, message, dialogue, allowed_list, admins_list).await
+                handle_list_users(bot, message, dialogue, allowed_list, admins_list).await?
             }
 
             "Список админов" => {
-                handle_list_admins(bot, message, dialogue, allowed_list, admins_list).await
+                handle_list_admins(bot, message, dialogue, allowed_list, admins_list).await?
             }
 
-            _ => Ok(()),
+            "Назад" => handle_start(bot, message, dialogue, allowed_list, admins_list).await?,
+
+            _ => {}
         };
-        match result {
-            Ok(_) => {}
-            Err(e) => eprintln!("Ошибка: {e}"),
-        }
     }
 
     Ok(())
@@ -383,10 +358,13 @@ async fn list_reports(
 
     let buttons3: Vec<KeyboardButton> = vec![KeyboardButton::new("Olap отчёт")];
 
+    let buttons4: Vec<KeyboardButton> = vec![KeyboardButton::new("Назад")];
+
     let keyboard = KeyboardMarkup::default()
         .append_row(buttons)
         .append_row(buttons2)
         .append_row(buttons3)
+        .append_row(buttons4)
         .one_time_keyboard();
 
     bot.send_message(message.chat.id, "Выберите опцию")
@@ -398,44 +376,11 @@ async fn list_reports(
     Ok(())
 }
 
-async fn handle_reports_wrapper(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    servers: Arc<Mutex<ServerState>>,
-    config: Cfg,
-    olap_store: SharedOlap,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
-    match handle_reports(
-        bot,
-        message,
-        dialogue,
-        servers,
-        config,
-        olap_store,
-        allowed_list,
-        admins_list,
-    )
-    .await
-    {
-        Ok(_) => {}
-        Err(e) => eprintln!("Ошибка: {e}"),
-    }
-
-    Ok(())
-}
-
 async fn handle_reports(
     bot: Bot,
     message: Message,
     dialogue: MyDialogue,
-    servers: Arc<Mutex<ServerState>>,
-    config: Cfg,
-    olap_store: SharedOlap,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
+    deps: DependenciesForDispatcher,
 ) -> Result<(), Box<dyn Error>> {
     let (bot_cloned, message_cloned, dialogue_cloned) =
         (bot.clone(), message.clone(), dialogue.clone());
@@ -443,54 +388,138 @@ async fn handle_reports(
     if let Some(text) = message.text() {
         match text {
             "За сегодня" => {
-                handle_today(bot, message, servers, config).await?;
+                handle_today(bot, message, deps.servers, deps.config).await?;
                 handle_start(
                     bot_cloned,
                     message_cloned,
                     dialogue_cloned,
-                    allowed_list,
-                    admins_list,
+                    deps.allowed_list,
+                    deps.admins_list,
                 )
                 .await?;
             }
+
             "За вчера" => {
-                handle_yesterday(bot, message, servers, config).await?;
+                handle_yesterday(bot, message, deps.servers, deps.config).await?;
                 handle_start(
                     bot_cloned,
                     message_cloned,
                     dialogue_cloned,
-                    allowed_list,
-                    admins_list,
+                    deps.allowed_list,
+                    deps.admins_list,
                 )
                 .await?;
             }
             "За 7 дней" => {
-                handle_week(bot, message, servers, config).await?;
+                handle_week(bot, message, deps.servers, deps.config).await?;
                 handle_start(
                     bot_cloned,
                     message_cloned,
                     dialogue_cloned,
-                    allowed_list,
-                    admins_list,
+                    deps.allowed_list,
+                    deps.admins_list,
                 )
                 .await?;
             }
+
             "За текущий месяц" => {
-                handle_month(bot, message, servers, config).await?;
+                handle_month(bot, message, deps.servers, deps.config).await?;
                 handle_start(
                     bot_cloned,
                     message_cloned,
                     dialogue_cloned,
-                    allowed_list,
-                    admins_list,
+                    deps.allowed_list,
+                    deps.admins_list,
                 )
                 .await?;
             }
             "Olap отчёт" => {
-                handle_olap(bot, message, servers, config, olap_store, dialogue).await?
+                handle_olap(
+                    bot,
+                    message,
+                    deps.servers,
+                    deps.config,
+                    deps.olap_store,
+                    dialogue,
+                )
+                .await?
+            }
+
+            "Назад" => {
+                handle_start(bot, message, dialogue, deps.allowed_list, deps.admins_list).await?
             }
             _ => {}
         };
+    }
+
+    Ok(())
+}
+
+async fn handle_states(
+    bot: Bot,
+    message: Message,
+    dialogue: MyDialogue,
+    deps: DependenciesForDispatcher,
+) -> ResponseResult<()> {
+    let state = dialogue.get().await.unwrap().unwrap();
+
+    let result = match state {
+        State::AddUser => {
+            handle_add_user_dialogue(bot, message, deps.allowed_list, dialogue, deps.admins_list)
+                .await
+        }
+        State::DeleteUser => {
+            callback_delete_user(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
+        }
+
+        State::Olap => {
+            callback_olap(
+                bot,
+                message,
+                deps.olap_store,
+                dialogue,
+                deps.allowed_list,
+                deps.admins_list,
+            )
+            .await
+        }
+
+        State::Switch => {
+            callback_switch(
+                bot,
+                message,
+                deps.servers,
+                dialogue,
+                deps.allowed_list,
+                deps.admins_list,
+            )
+            .await
+        }
+
+        State::Dialogue => {
+            handle_dialogue(
+                bot,
+                message,
+                dialogue,
+                deps.servers,
+                deps.allowed_list,
+                deps.admins_list,
+            )
+            .await
+        }
+
+        State::Report => handle_reports(bot, message, dialogue, deps.clone()).await,
+
+        State::Admin => {
+            callback_admin(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
+        }
+        State::None => {
+            handle_start(bot, message, dialogue, deps.allowed_list, deps.admins_list).await
+        }
+    };
+
+    if let Err(e) = result {
+        eprintln!("Ошибка: {e}")
     }
 
     Ok(())
@@ -735,12 +764,14 @@ async fn handle_olap(
             m
         },
     };
-    let form_json = serde_json::to_string_pretty(&form).unwrap();
 
-    let olap = Server::get_olap(form_json, server_url, server.get_token().await.unwrap())
-        .await
-        .unwrap_or_default();
-    server.deauth().await.unwrap();
+    let form_json = serde_json::to_string_pretty(&form)?;
+
+    let token = server.get_token().await?;
+
+    let olap = Server::get_olap(form_json, server_url, token).await?;
+
+    server.deauth().await?;
 
     *olap_store.lock().await = olap.clone();
 
@@ -792,21 +823,6 @@ async fn handle_add_user(
 
 type MyDialogue = Dialogue<State, InMemStorage<State>>;
 
-async fn handle_add_user_dialogue_wrapper(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
-    match handle_add_user_dialogue(bot, message, allowed_list, dialogue, admins_list).await {
-        Ok(_) => {}
-        Err(e) => eprintln!("Ошибка: {}", e),
-    }
-
-    Ok(())
-}
-
 async fn handle_add_user_dialogue(
     bot: Bot,
     message: Message,
@@ -814,7 +830,9 @@ async fn handle_add_user_dialogue(
     dialogue: MyDialogue,
     admins_list: Arc<Vec<String>>,
 ) -> Result<(), Box<dyn Error>> {
-    let username = message.text().unwrap();
+    let username = message
+        .text()
+        .ok_or("Ну удалось получить текст сообщения")?;
 
     if username.is_empty() {
         bot.send_message(message.chat.id, "Вы не ввели имя пользователя.")
@@ -954,8 +972,10 @@ async fn callback_switch(
     dialogue: MyDialogue,
     allowed_list: Arc<Mutex<Vec<String>>>,
     admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
-    let data = message.text().unwrap_or_default();
+) -> Result<(), Box<dyn Error>> {
+    let data = message
+        .text()
+        .ok_or("Невозможно получить текст сообщения")?;
 
     let mut server = servers.lock().await;
 
@@ -968,11 +988,9 @@ async fn callback_switch(
         .await?;
     }
 
-    dialogue.update(State::None).await.unwrap_or_default();
+    dialogue.update(State::None).await?;
 
-    if let Err(e) = handle_start(bot, message, dialogue, allowed_list, admins_list).await {
-        eprintln!("Ошибка: {e}");
-    }
+    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
 
     Ok(())
 }
@@ -984,8 +1002,10 @@ async fn callback_olap(
     dialogue: MyDialogue,
     allowed_list: Arc<Mutex<Vec<String>>>,
     admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
-    let data = message.text().unwrap_or_default();
+) -> Result<(), Box<dyn Error>> {
+    let data = message
+        .text()
+        .ok_or("Невозможно получить текст сообщения")?;
 
     let olap = olap_store.lock().await;
 
@@ -997,11 +1017,9 @@ async fn callback_olap(
             .await?;
     }
 
-    dialogue.update(State::None).await.unwrap();
+    dialogue.update(State::None).await?;
 
-    if let Err(e) = handle_start(bot, message, dialogue, allowed_list, admins_list).await {
-        eprintln!("Ошибка: {e}");
-    }
+    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
 
     Ok(())
 }
@@ -1012,8 +1030,11 @@ async fn callback_delete_user(
     dialogue: MyDialogue,
     allowed: Arc<Mutex<Vec<String>>>,
     admins_list: Arc<Vec<String>>,
-) -> ResponseResult<()> {
-    let data = message.text().unwrap_or_default().to_string();
+) -> Result<(), Box<dyn Error>> {
+    let data = message
+        .text()
+        .ok_or("Невозможно получить текст сообщения")?
+        .to_string();
 
     let removed = {
         let mut accounts = allowed.lock().await;
@@ -1026,18 +1047,18 @@ async fn callback_delete_user(
     };
 
     if removed {
-        let mut telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await.unwrap();
+        let mut telegram_config: TgCfg = read_to_struct("/etc/iiko-bot/tg_cfg.toml").await?;
         telegram_config.accounts.retain(|account| account != &data);
 
-        let mut file = fs::File::create("/etc/iiko-bot/tg_cfg.toml").await.unwrap();
-        let config = toml::to_string(&telegram_config).unwrap();
-        file.write_all(config.as_bytes()).await.unwrap();
+        let mut file = fs::File::create("/etc/iiko-bot/tg_cfg.toml").await?;
+        let config = toml::to_string(&telegram_config)?;
+        file.write_all(config.as_bytes()).await?;
 
         let text = format!("Пользователь @{} успешно удалён", data);
         bot.send_message(message.chat.id, text).await?;
     }
 
-    dialogue.update(State::None).await.unwrap();
+    dialogue.update(State::None).await?;
 
     let allowed_clone = Arc::clone(&allowed);
 
