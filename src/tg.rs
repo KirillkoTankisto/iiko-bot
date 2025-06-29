@@ -297,10 +297,7 @@ async fn handle_start(
         KeyboardButton::new("Сменить сервер"),
     ];
 
-    let buttons2: Vec<KeyboardButton> = vec![
-        KeyboardButton::new("Список серверов"),
-        KeyboardButton::new("Администрирование"),
-    ];
+    let buttons2: Vec<KeyboardButton> = vec![KeyboardButton::new("Администрирование")];
 
     let keyboard = KeyboardMarkup::default()
         .append_row(buttons)
@@ -330,9 +327,6 @@ async fn handle_dialogue(
         let result = match text {
             "Отчёты" => list_reports(bot, message, dialogue).await,
             "Сменить сервер" => handle_switch(bot, message, servers, dialogue).await,
-            "Список серверов" => {
-                handle_list(bot, message, dialogue, servers, allowed_list, admins_list).await
-            }
             "Администрирование" => {
                 handle_admin(bot, message, dialogue, allowed_list, admins_list).await
             }
@@ -484,15 +478,21 @@ async fn handle_today(
 
     let shift = Server::latest_shift(shifts, offset)?;
 
+    let mut date = shift.open_date;
+
+    date.truncate(10);
+
     let text = format!(
         "*Сервер*: *{}*\n\
                  *Текущая смена*:\n\
+                 Дата: *{}*\n\
                  Номер смены: *{}*\n\
                  Статус: *{}*\n\
                  Оплачено картой: *{}*\n\
                  Оплачено наличкой: *{}*\n\
                  Итог: *{}*",
         current_server,
+        escape(&date),
         escape(&format_with_dots(shift.session_number)),
         shift.session_status.to_string(),
         escape(&format_with_dots(shift.sales_card as usize)),
@@ -523,15 +523,21 @@ async fn handle_yesterday(
     let offset: usize = 1;
     let shift = Server::latest_shift(shifts, offset)?;
 
+    let mut date = shift.open_date;
+
+    date.truncate(10);
+
     let text = format!(
         "*Сервер*: *{}*\n\
                  *Предыдущая смена*:\n\
+                 Дата: *{}*\n\
                  Номер смены: *{}*\n\
                  Статус: *{}*\n\
                  Оплачено картой: *{}*\n\
                  Оплачено наличкой: *{}*\n\
                  Итог: *{}*",
         current_server,
+        escape(&date),
         escape(&format_with_dots(shift.session_number)),
         shift.session_status.to_string(),
         escape(&format_with_dots(shift.sales_card as usize)),
@@ -617,10 +623,25 @@ async fn handle_switch(
         (current_server, keys)
     };
 
+    let buttons: Vec<KeyboardButton> = server_keys
+        .iter()
+        .map(|key| KeyboardButton::new(key))
+        .collect();
+
+    let rows: Vec<Vec<KeyboardButton>> = buttons
+        .chunks(2) // create slices of up to 2 items
+        .map(|chunk| chunk.to_vec()) // turn each slice into a Vec<Button>
+        .collect();
+
     let mut keyboard = KeyboardMarkup::default().one_time_keyboard();
-    for key in server_keys {
-        keyboard = keyboard.append_row(vec![KeyboardButton::new(key.clone())]);
+
+    for row in rows {
+        keyboard = keyboard.append_row(row);
     }
+
+    let escape_button = vec![KeyboardButton::new("Назад")];
+
+    keyboard = keyboard.append_row(escape_button);
 
     let text = format!("Текущий сервер: *{}*", current_server);
 
@@ -658,40 +679,6 @@ async fn callback_switch(
     }
 
     dialogue.update(State::None).await?;
-
-    handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
-
-    Ok(())
-}
-
-//
-
-async fn handle_list(
-    bot: Bot,
-    message: Message,
-    dialogue: MyDialogue,
-    servers: Arc<Mutex<ServerState>>,
-    allowed_list: Arc<Mutex<Vec<String>>>,
-    admins_list: Arc<Vec<String>>,
-) -> Result<(), Box<dyn Error>> {
-    let text = servers
-        .lock()
-        .await
-        .map
-        .iter()
-        .map(|server| format!("{} -> {}", server.0, server.1))
-        .collect::<Vec<String>>()
-        .join("\n");
-
-    let text = format!(
-        "*Список серверов*:\n{}\n*Выбранный сервер*: *{}*",
-        escape(&text),
-        servers.lock().await.current
-    );
-
-    bot.send_message(message.chat.id, text)
-        .parse_mode(ParseMode::MarkdownV2)
-        .await?;
 
     handle_start(bot, message, dialogue, allowed_list, admins_list).await?;
 
@@ -976,15 +963,10 @@ async fn handle_delete_user(
 
     let text = format!("Выберите аккаунт для удаления");
 
-    match bot
-        .send_message(message.chat.id, text)
+    bot.send_message(message.chat.id, text)
         .parse_mode(ParseMode::MarkdownV2)
         .reply_markup(keyboard)
-        .await
-    {
-        Ok(_) => (),
-        Err(e) => eprintln!("{:?}", e),
-    };
+        .await?;
 
     dialogue.update(State::DeleteUser).await?;
 
@@ -1047,7 +1029,12 @@ async fn handle_list_users(
 ) -> Result<(), Box<dyn Error>> {
     let accounts = allowed_list.lock().await;
 
-    let list = accounts.iter().cloned().collect::<Vec<String>>().join("\n");
+    let list = accounts
+        .iter()
+        .cloned()
+        .map(|nickname| format!("@{nickname}"))
+        .collect::<Vec<String>>()
+        .join("\n");
 
     drop(accounts);
 
@@ -1077,6 +1064,7 @@ async fn handle_list_admins(
     let list = admins_list
         .iter()
         .cloned()
+        .map(|nickname| format!("@{nickname}"))
         .collect::<Vec<String>>()
         .join("\n");
 
