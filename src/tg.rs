@@ -198,7 +198,7 @@ async fn handle_states(
             }
 
             State::Dialogue => {
-                handle_dialogue(
+                callback_start(
                     bot,
                     message,
                     dialogue,
@@ -209,7 +209,7 @@ async fn handle_states(
                 .await
             }
 
-            State::Report => handle_reports(bot, message, dialogue, deps.clone()).await,
+            State::Report => callback_reports(bot, message, dialogue, deps.clone()).await,
 
             State::Olap => {
                 callback_olap(
@@ -240,14 +240,7 @@ async fn handle_states(
             }
 
             State::AddUser => {
-                handle_add_user_dialogue(
-                    bot,
-                    message,
-                    deps.allowed_list,
-                    dialogue,
-                    deps.admins_list,
-                )
-                .await
+                callback_add_user(bot, message, deps.allowed_list, dialogue, deps.admins_list).await
             }
             State::DeleteUser => {
                 callback_delete_user(bot, message, dialogue, deps.allowed_list, deps.admins_list)
@@ -315,7 +308,7 @@ async fn handle_start(
 
 //
 
-async fn handle_dialogue(
+async fn callback_start(
     bot: Bot,
     message: Message,
     dialogue: MyDialogue,
@@ -325,7 +318,7 @@ async fn handle_dialogue(
 ) -> Result<(), Box<dyn Error>> {
     if let Some(text) = message.text() {
         let result = match text {
-            "Отчёты" => list_reports(bot, message, dialogue).await,
+            "Отчёты" => handle_reports(bot, message, dialogue).await,
             "Сменить сервер" => handle_switch(bot, message, servers, dialogue).await,
             "Администрирование" => {
                 handle_admin(bot, message, dialogue, allowed_list, admins_list).await
@@ -344,7 +337,7 @@ async fn handle_dialogue(
 
 //
 
-async fn list_reports(
+async fn handle_reports(
     bot: Bot,
     message: Message,
     dialogue: MyDialogue,
@@ -379,7 +372,7 @@ async fn list_reports(
     Ok(())
 }
 
-async fn handle_reports(
+async fn callback_reports(
     bot: Bot,
     message: Message,
     dialogue: MyDialogue,
@@ -894,7 +887,7 @@ async fn handle_add_user(
     Ok(())
 }
 
-async fn handle_add_user_dialogue(
+async fn callback_add_user(
     bot: Bot,
     message: Message,
     allowed_list: Arc<Mutex<Vec<String>>>,

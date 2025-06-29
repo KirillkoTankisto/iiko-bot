@@ -13,9 +13,8 @@ use serde_json::from_str;
 
 use crate::{
     date::{moscow_last_, moscow_time},
-    make_url,
     olap::{OLAPList, OlapElement, OlapMap, wrap_text},
-    shared::sha1sum,
+    shared::{make_url, sha1sum},
 };
 
 //
@@ -102,7 +101,7 @@ impl Server {
 
     async fn auth(&mut self) -> Result<(), Box<dyn Error>> {
         if !self.is_authenticated() {
-            let url = make_url::default(&self.url, &["auth"]);
+            let url = make_url(&self.url, &["auth"]);
 
             let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
 
@@ -135,7 +134,7 @@ impl Server {
 
     pub async fn deauth(&mut self) -> Result<(), Box<dyn Error>> {
         if self.is_authenticated() {
-            let url = make_url::default(&self.url, &["logout"]);
+            let url = make_url(&self.url, &["logout"]);
 
             let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
 
@@ -201,7 +200,7 @@ impl GetShifts for Server {
     ) -> Result<Shifts, Box<dyn Error>> {
         server.auth().await?;
 
-        let url = make_url::default(&server.url, &["v2", "cashshifts", "list"]);
+        let url = make_url(&server.url, &["v2", "cashshifts", "list"]);
 
         let date_from = match date {
             Dates::Week => moscow_last_(6),
@@ -272,7 +271,7 @@ impl Olap for Server {
         server_url: String,
         key: String,
     ) -> Result<OlapMap, Box<dyn Error>> {
-        let url = make_url::default(&server_url, &["v2", "reports", "olap"]);
+        let url = make_url(&server_url, &["v2", "reports", "olap"]);
 
         let retry_policy = ExponentialBackoff::builder().build_with_max_retries(3);
 

@@ -1,6 +1,5 @@
 mod date;
 mod iiko;
-mod make_url;
 mod olap;
 mod shared;
 mod tg;
