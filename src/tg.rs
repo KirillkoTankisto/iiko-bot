@@ -1,7 +1,7 @@
 use crate::date::moscow_time;
 use crate::iiko::{Dates, GetShifts, Olap, Server};
 use crate::olap::{Filter, OlapMap, PeriodType, ReportConfig, ReportType};
-use crate::{Cfg, ServerState, shared::read_to_struct};
+use crate::shared::read_to_struct;
 
 //
 
@@ -40,11 +40,23 @@ type MyDialogue = Dialogue<State, InMemStorage<State>>;
 
 //
 
+#[derive(Deserialize, Clone)]
+struct Cfg {
+    login: String,
+    pass: String,
+    servers: HashMap<String, String>,
+}
+
 #[derive(Deserialize, Serialize)]
 struct TgCfg {
     token: String,
     accounts: Vec<String>,
     admins: Vec<String>,
+}
+
+struct ServerState {
+    map: HashMap<String, String>,
+    current: String,
 }
 
 #[derive(Clone)]

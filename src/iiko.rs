@@ -1,20 +1,24 @@
 use std::{
     collections::HashMap,
     error::Error,
+    fmt::Display,
     time::{Duration, Instant},
 };
 
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{RetryTransientMiddleware, policies::ExponentialBackoff};
+
+use serde::Deserialize;
 use serde_json::from_str;
 
 use crate::{
-    Shift, Shifts,
     date::{moscow_last_, moscow_time},
     make_url,
     olap::{OLAPList, OlapElement, OlapMap, wrap_text},
-    sha1sum,
+    shared::sha1sum,
 };
+
+//
 
 #[allow(dead_code)]
 pub enum Dates {
@@ -22,6 +26,62 @@ pub enum Dates {
     ThisMonth,
     Custom,
 }
+
+//
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SessionStatus {
+    OPEN,
+    CLOSED,
+    ACCEPTED,
+    UNACCEPTED,
+    HASWARNINGS,
+}
+
+impl Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OPEN => write!(f, "Открыта"),
+            _ => write!(f, "Закрыта"),
+        }
+    }
+}
+
+//
+
+#[allow(dead_code)]
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Shift {
+    pub id: String,
+    pub session_number: usize,
+    pub fiscal_number: usize,
+    pub cash_reg_number: usize,
+    pub cash_reg_serial: String,
+    pub open_date: String,
+    pub close_date: Option<String>,
+    pub accept_date: Option<String>,
+    pub manager_id: String,
+    pub responsible_user_id: Option<String>,
+    pub session_start_cash: usize,
+    pub pay_orders: f64,
+    pub sum_writeoff_orders: usize,
+    pub sales_cash: usize,
+    pub sales_credit: usize,
+    pub sales_card: f64,
+    pub pay_in: usize,
+    pub pay_out: usize,
+    pub pay_income: i32,
+    pub cash_remain: Option<usize>,
+    pub cash_diff: i32,
+    pub session_status: SessionStatus,
+    pub conception_id: Option<String>,
+}
+
+pub type Shifts = Vec<Shift>;
+
+//
 
 pub struct Server {
     login: String,
@@ -118,6 +178,8 @@ impl Server {
     }
 }
 
+//
+
 pub trait GetShifts {
     async fn list_shifts_with_offset<Num: Into<i64>>(
         server: &mut Server,
@@ -195,6 +257,8 @@ impl GetShifts for Server {
         shifts.iter().map(|shift| shift.pay_orders).sum()
     }
 }
+
+//
 
 pub trait Olap {
     async fn get_olap(form: String, url: String, key: String) -> Result<OlapMap, Box<dyn Error>>;
@@ -341,6 +405,8 @@ impl Olap for Server {
     }
 }
 
+//
+
 #[derive(Clone)]
 struct NewToken {
     id: String,
@@ -353,3 +419,5 @@ impl NewToken {
         self.creation_time.elapsed() >= self.lifetime
     }
 }
+
+//
